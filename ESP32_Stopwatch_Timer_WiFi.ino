@@ -15,6 +15,7 @@
 #define LONG_PRESS_MS 2000UL
 #define HOLD_REPEAT_MS 150UL
 #define MAX_TIMER_MINUTES 60
+#define FANFARE_DURATION_MS 5000UL
 
 // Setup AP credentials: connect to this network to configure the home Wi-Fi.
 const char* AP_SSID = "Timer-Setup";
@@ -39,6 +40,10 @@ TimerState timerState = T_IDLE;
 uint16_t timerMinutes = 1;          // set value: 0..60
 uint64_t timerRemainingMs = 0;
 uint32_t timerLastUpdate = 0;
+
+// Fanfare shown when the countdown reaches zero.
+bool fanfareActive = false;
+uint32_t fanfareStartMs = 0;
 
 enum TouchEvent { EVENT_NONE, EVENT_SINGLE_TAP, EVENT_DOUBLE_TAP };
 TouchEvent currentEvent = EVENT_NONE;
@@ -86,46 +91,69 @@ void drawCenteredText(const char* text, uint8_t size, int16_t y) {
   display.print(text);
 }
 
+void renderStopwatch() {
+  char buf[20];
+  uint64_t totalSeconds = swElapsedMs / 1000ULL;
+  uint32_t hours = totalSeconds / 3600ULL;
+  uint8_t minutes = (totalSeconds / 60ULL) % 60;
+  uint8_t seconds = totalSeconds % 60;
+  if (hours <= 99) snprintf(buf, sizeof(buf), "%02lu:%02u:%02u",
+                           (unsigned long)hours, minutes, seconds);
+  else snprintf(buf, sizeof(buf), "%lu:%02u:%02u",
+                (unsigned long)hours, minutes, seconds);
+  drawCenteredText(buf, 2, 22);
+}
+
+void renderTimer() {
+  char buf[20];
+  uint16_t shownMin;
+  if (timerState == T_IDLE || timerState == T_SETUP) {
+    shownMin = timerMinutes;
+  } else {
+    shownMin = (timerRemainingMs + 59999ULL) / 60000ULL; // round up
+  }
+  if (shownMin > MAX_TIMER_MINUTES) shownMin = MAX_TIMER_MINUTES;
+  snprintf(buf, sizeof(buf), "%02u", (unsigned)shownMin);
+  drawCenteredText(buf, 5, 10);
+
+  // Bottom progress bar: 3 px tall, 128 px wide, one-minute span.
+  int16_t frac = 0;
+  if (timerState == T_RUNNING || timerState == T_PAUSED) {
+    uint32_t remInMin = (uint32_t)(timerRemainingMs % 60000ULL);
+    uint32_t secsRem = (remInMin + 999UL) / 1000UL;
+    if (secsRem == 0) secsRem = 60;
+    uint32_t secsElapsed = 60UL - secsRem;
+    frac = (int16_t)((secsElapsed * 128UL) / 60UL);
+    if (frac > 128) frac = 128;
+  }
+  if (frac > 0) display.fillRect(0, 61, frac, 3, SH110X_WHITE);
+}
+
 void renderDisplay() {
   display.clearDisplay();
-  char buf[20];
 
-  if (currentMode == MODE_STOPWATCH) {
-    uint64_t totalSeconds = swElapsedMs / 1000ULL;
-    uint32_t hours = totalSeconds / 3600ULL;
-    uint8_t minutes = (totalSeconds / 60ULL) % 60;
-    uint8_t seconds = totalSeconds % 60;
-    if (hours <= 99) snprintf(buf, sizeof(buf), "%02lu:%02u:%02u",
-                             (unsigned long)hours, minutes, seconds);
-    else snprintf(buf, sizeof(buf), "%lu:%02u:%02u",
-                  (unsigned long)hours, minutes, seconds);
-    drawCenteredText(buf, 2, 22);
-  } else {
-    // Timer mode: two digits, only minutes.
-    uint16_t shownMin;
-    if (timerState == T_IDLE || timerState == T_SETUP) {
-      shownMin = timerMinutes;
+  // Fanfare has priority: alternate "screen lit, no digits" and "digits only"
+  // every second for FANFARE_DURATION_MS.
+  if (fanfareActive) {
+    uint32_t elapsed = millis() - fanfareStartMs;
+    bool whitePhase = ((elapsed / 1000UL) % 2UL) == 0;
+    if (whitePhase) {
+      display.fillRect(0, 0, 128, 64, SH110X_WHITE);
     } else {
-      shownMin = (timerRemainingMs + 59999ULL) / 60000ULL; // round up
+      // Normal digits only (set value), no progress bar.
+      char buf[20];
+      snprintf(buf, sizeof(buf), "%02u", (unsigned)timerMinutes);
+      drawCenteredText(buf, 5, 10);
     }
-    if (shownMin > MAX_TIMER_MINUTES) shownMin = MAX_TIMER_MINUTES;
-    snprintf(buf, sizeof(buf), "%02u", (unsigned)shownMin);
-    drawCenteredText(buf, 5, 10);
-
-    // Bottom progress bar: 3 px tall, 128 px wide.
-    // Represents progress within the current minute (60 s).
-    int16_t frac = 0;
-    if (timerState == T_RUNNING || timerState == T_PAUSED) {
-      uint32_t remInMin = (uint32_t)(timerRemainingMs % 60000ULL);
-      uint32_t secsRem = (remInMin + 999UL) / 1000UL;
-      if (secsRem == 0) secsRem = 60;
-      uint32_t secsElapsed = 60UL - secsRem;
-      frac = (int16_t)((secsElapsed * 128UL) / 60UL);
-      if (frac > 128) frac = 128;
-    }
-    if (frac > 0) display.fillRect(0, 61, frac, 3, SH110X_WHITE);
+    display.display();
+    return;
   }
 
+  if (currentMode == MODE_STOPWATCH) {
+    renderStopwatch();
+  } else {
+    renderTimer();
+  }
   display.display();
 }
 
@@ -154,7 +182,6 @@ void onLongPressStart() {
     swLastUpdate = millis();
   } else {
     // Timer: stop whatever is running and enter setup mode.
-    // Value keeps its current set value; user increments from here.
     timerState = T_SETUP;
     timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
     touchHoldTickTime = millis();
@@ -189,14 +216,23 @@ void updateTimer() {
   if (timerState == T_RUNNING) {
     uint32_t delta = (uint32_t)(now - timerLastUpdate);
     if ((uint64_t)delta >= timerRemainingMs) {
-      // Countdown finished: return to idle with the set value.
-      timerState = T_IDLE;
+      // Countdown finished: stop, restore set value, start the fanfare.
       timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
+      timerState = T_IDLE;
+      fanfareActive = true;
+      fanfareStartMs = millis();
     } else {
       timerRemainingMs -= delta;
     }
   }
   timerLastUpdate = now;
+}
+
+void updateFanfare() {
+  if (!fanfareActive) return;
+  if ((uint32_t)(millis() - fanfareStartMs) >= FANFARE_DURATION_MS) {
+    fanfareActive = false;
+  }
 }
 
 void processTouch() {
@@ -247,15 +283,29 @@ void handleEvents() {
   currentEvent = EVENT_NONE;
   lastActivityTime = millis();
 
+  // During the fanfare, a single tap cancels it and does nothing else.
+  if (fanfareActive) {
+    if (event == EVENT_SINGLE_TAP) {
+      fanfareActive = false;
+      renderDisplay();
+    }
+    return;
+  }
+
   if (event == EVENT_DOUBLE_TAP) {
-    // Switching is allowed as long as the stopwatch isn't actively running.
-    if (swState != SW_RUNNING) {
-      if (currentMode == MODE_TIMER) {
-        // Leaving timer mode stops the countdown and restores the set value.
-        timerState = T_IDLE;
-        timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
-      }
-      currentMode = (currentMode == MODE_STOPWATCH) ? MODE_TIMER : MODE_STOPWATCH;
+    if (currentMode == MODE_STOPWATCH) {
+      // Always switch to timer and reset the stopwatch on the way out,
+      // even if it was running or paused.
+      updateStopwatch();
+      swElapsedMs = 0;
+      swState = SW_STOPPED;
+      swLastUpdate = millis();
+      currentMode = MODE_TIMER;
+    } else {
+      // Leaving timer mode stops the countdown and restores the set value.
+      timerState = T_IDLE;
+      timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
+      currentMode = MODE_STOPWATCH;
     }
     return;
   }
@@ -379,6 +429,7 @@ void restoreState() {
   timerLastUpdate = millis();
 
   currentMode = MODE_STOPWATCH;
+  fanfareActive = false;
 }
 
 void setup() {
@@ -406,9 +457,7 @@ void loop() {
   webActivity = false;
   server.handleClient();
 
-  // Wake the display on touch or web activity. The touch is NOT consumed, so
-  // a long press that started while the screen was off still triggers its
-  // action after 2 seconds.
+  // Wake the display on touch or web activity.
   if (!displayOn) {
     bool touched = digitalRead(TOUCH_PIN) == HIGH;
     if (webActivity || (touched && !lastTouchState)) {
@@ -420,6 +469,7 @@ void loop() {
       lastTouchState = touched;
       updateStopwatch();
       updateTimer();
+      updateFanfare();
       if (webActivity) lastActivityTime = millis();
       delay(5);
       return;
@@ -429,6 +479,7 @@ void loop() {
   processTouch();
   updateStopwatch();
   updateTimer();
+  updateFanfare();
   handleEvents();
 
   if (webActivity) lastActivityTime = millis();
@@ -437,7 +488,7 @@ void loop() {
 
   bool stopwatchActive = (swState == SW_RUNNING) || (swState == SW_PAUSED);
   bool timerActive = (timerState == T_RUNNING) || (timerState == T_PAUSED) ||
-                     (timerState == T_SETUP);
+                     (timerState == T_SETUP) || fanfareActive;
   if (!stopwatchActive && !timerActive &&
       (uint32_t)(millis() - lastActivityTime) >= IDLE_TIMEOUT_MS) {
     turnDisplayOff();
