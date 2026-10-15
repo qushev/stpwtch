@@ -2,13 +2,17 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <Preferences.h>
+#include <ImprovWiFiLibrary.h>
+#include "esp_sleep.h"
 
+// --- Пины ---
 #define SDA_PIN 8
 #define SCL_PIN 9
-#define TOUCH_PIN 7
+#define TOUCH_PIN 2   // RTC GPIO для пробуждения из deep sleep
+#define BUZZER_PIN 7  // Пьезо-излучатель
 
+// --- Тайминги ---
 #define IDLE_TIMEOUT_MS (5UL * 60UL * 1000UL)
 #define TAP_MIN_MS 50UL
 #define DOUBLE_TAP_MS 300UL
@@ -17,34 +21,42 @@
 #define MAX_TIMER_MINUTES 60
 #define FANFARE_DURATION_MS 5000UL
 
-// Setup AP credentials: connect to this network to configure the home Wi-Fi.
-const char* AP_SSID = "Timer-Setup";
-const char* AP_PASSWORD = "configure123";
+// --- Бузер ---
+#define BUZZER_FREQ 2700  // резонансная частота типичного пьезо-излучателя
 
 Adafruit_SH1106G display(128, 64, &Wire, -1);
-WebServer server(80);
 Preferences preferences;
+ImprovWiFi improvSerial(&Serial);
 
+// --- Состояния ---
 enum Mode { MODE_STOPWATCH, MODE_TIMER };
 Mode currentMode = MODE_STOPWATCH;
 
-// Stopwatch: stopped -> running -> paused -> running -> ... ; long press resets.
 enum SwState { SW_STOPPED, SW_RUNNING, SW_PAUSED };
 SwState swState = SW_STOPPED;
 uint64_t swElapsedMs = 0;
 uint32_t swLastUpdate = 0;
 
-// Timer: idle (ready to start) / setup (holding to set minutes) / running / paused.
 enum TimerState { T_IDLE, T_SETUP, T_RUNNING, T_PAUSED };
 TimerState timerState = T_IDLE;
-uint16_t timerMinutes = 1;          // set value: 0..60
+uint16_t timerMinutes = 1;
 uint64_t timerRemainingMs = 0;
 uint32_t timerLastUpdate = 0;
 
-// Fanfare shown when the countdown reaches zero.
 bool fanfareActive = false;
 uint32_t fanfareStartMs = 0;
 
+// --- Бузер ---
+bool buzzerActive = false;
+uint8_t buzzerStep = 0;
+uint32_t buzzerStepStartMs = 0;
+
+// Паттерн китайского будильника:
+//   ON 150 ms, OFF 100 ms, ON 150 ms, OFF 100 ms, ON 150 ms, OFF 500 ms, повтор.
+const uint16_t buzzerPatternMs[] = {150, 100, 150, 100, 150, 500};
+const uint8_t BUZZER_PATTERN_LEN = 6;
+
+// --- Сенсор ---
 enum TouchEvent { EVENT_NONE, EVENT_SINGLE_TAP, EVENT_DOUBLE_TAP };
 TouchEvent currentEvent = EVENT_NONE;
 
@@ -55,33 +67,67 @@ uint32_t touchHoldTickTime = 0;
 bool pendingSingleTap = false;
 uint32_t lastTapTime = 0;
 uint32_t lastActivityTime = 0;
-bool wifiConfigured = false;
-bool webActivity = false;
-bool displayOn = true;
 
-// Forward declarations
+bool displayOn = true;
+bool wokeFromSleep = false;
+
+// --- Прототипы ---
 void renderDisplay();
-void turnDisplayOn();
 void turnDisplayOff();
+void turnDisplayOn();
 void onLongPressStart();
 void onHoldTick();
 void onLongPressEnd();
+void goToDeepSleep();
 
-String htmlEscape(const String& s) {
-  String out;
-  out.reserve(s.length());
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '&') out += F("&amp;");
-    else if (c == '<') out += F("&lt;");
-    else if (c == '>') out += F("&gt;");
-    else if (c == '"') out += F("&quot;");
-    else if (c == '\'') out += F("&#39;");
-    else out += c;
-  }
-  return out;
+// ============================================================
+//  Improv Wi-Fi callbacks
+// ============================================================
+void onImprovConnected(const char* ssid, const char* password) {
+  Serial.printf("Improv: Connected to %s\n", ssid);
 }
 
+void onImprovError(ImprovTypes::Error err) {
+  Serial.printf("Improv error: %d\n", err);
+}
+
+// ============================================================
+//  Buzzer
+// ============================================================
+void buzzerToneOn() {
+  ledcWriteTone(BUZZER_PIN, BUZZER_FREQ);
+}
+
+void buzzerToneOff() {
+  ledcWrite(BUZZER_PIN, 0);
+}
+
+void startBuzzer() {
+  buzzerActive = true;
+  buzzerStep = 0;
+  buzzerStepStartMs = millis();
+  buzzerToneOn();
+}
+
+void stopBuzzer() {
+  buzzerActive = false;
+  buzzerToneOff();
+}
+
+void updateBuzzer() {
+  if (!buzzerActive) return;
+  uint32_t now = millis();
+  if ((uint32_t)(now - buzzerStepStartMs) >= buzzerPatternMs[buzzerStep]) {
+    buzzerStep = (buzzerStep + 1) % BUZZER_PATTERN_LEN;
+    buzzerStepStartMs = now;
+    if (buzzerStep % 2 == 0) buzzerToneOn();
+    else buzzerToneOff();
+  }
+}
+
+// ============================================================
+//  Display
+// ============================================================
 void drawCenteredText(const char* text, uint8_t size, int16_t y) {
   display.setTextSize(size);
   int16_t x1, y1;
@@ -110,13 +156,12 @@ void renderTimer() {
   if (timerState == T_IDLE || timerState == T_SETUP) {
     shownMin = timerMinutes;
   } else {
-    shownMin = (timerRemainingMs + 59999ULL) / 60000ULL; // round up
+    shownMin = (timerRemainingMs + 59999ULL) / 60000ULL;
   }
   if (shownMin > MAX_TIMER_MINUTES) shownMin = MAX_TIMER_MINUTES;
   snprintf(buf, sizeof(buf), "%02u", (unsigned)shownMin);
   drawCenteredText(buf, 5, 10);
 
-  // Bottom progress bar: 3 px tall, 128 px wide, one-minute span.
   int16_t frac = 0;
   if (timerState == T_RUNNING || timerState == T_PAUSED) {
     uint32_t remInMin = (uint32_t)(timerRemainingMs % 60000ULL);
@@ -132,15 +177,12 @@ void renderTimer() {
 void renderDisplay() {
   display.clearDisplay();
 
-  // Fanfare has priority: alternate "screen lit, no digits" and "digits only"
-  // every second for FANFARE_DURATION_MS.
   if (fanfareActive) {
     uint32_t elapsed = millis() - fanfareStartMs;
     bool whitePhase = ((elapsed / 1000UL) % 2UL) == 0;
     if (whitePhase) {
       display.fillRect(0, 0, 128, 64, SH110X_WHITE);
     } else {
-      // Normal digits only (set value), no progress bar.
       char buf[20];
       snprintf(buf, sizeof(buf), "%02u", (unsigned)timerMinutes);
       drawCenteredText(buf, 5, 10);
@@ -173,15 +215,16 @@ void turnDisplayOn() {
   renderDisplay();
 }
 
+// ============================================================
+//  Long press handlers
+// ============================================================
 void onLongPressStart() {
   lastActivityTime = millis();
   if (currentMode == MODE_STOPWATCH) {
-    // Reset stopwatch immediately, while the sensor is still held.
     swElapsedMs = 0;
     swState = SW_STOPPED;
     swLastUpdate = millis();
   } else {
-    // Timer: stop whatever is running and enter setup mode.
     timerState = T_SETUP;
     timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
     touchHoldTickTime = millis();
@@ -191,7 +234,7 @@ void onLongPressStart() {
 void onHoldTick() {
   if (currentMode != MODE_TIMER || timerState != T_SETUP) return;
   timerMinutes++;
-  if (timerMinutes > MAX_TIMER_MINUTES) timerMinutes = 0; // cycle 60 -> 00
+  if (timerMinutes > MAX_TIMER_MINUTES) timerMinutes = 0;
   lastActivityTime = millis();
 }
 
@@ -199,10 +242,13 @@ void onLongPressEnd() {
   if (currentMode != MODE_TIMER || timerState != T_SETUP) return;
   timerState = T_IDLE;
   timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
-  preferences.putUShort("tmins", timerMinutes); // save set value
+  preferences.putUShort("tmins", timerMinutes);
   lastActivityTime = millis();
 }
 
+// ============================================================
+//  Updates
+// ============================================================
 void updateStopwatch() {
   uint32_t now = millis();
   if (swState == SW_RUNNING) {
@@ -216,11 +262,11 @@ void updateTimer() {
   if (timerState == T_RUNNING) {
     uint32_t delta = (uint32_t)(now - timerLastUpdate);
     if ((uint64_t)delta >= timerRemainingMs) {
-      // Countdown finished: stop, restore set value, start the fanfare.
       timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
       timerState = T_IDLE;
       fanfareActive = true;
       fanfareStartMs = millis();
+      startBuzzer();
     } else {
       timerRemainingMs -= delta;
     }
@@ -232,9 +278,13 @@ void updateFanfare() {
   if (!fanfareActive) return;
   if ((uint32_t)(millis() - fanfareStartMs) >= FANFARE_DURATION_MS) {
     fanfareActive = false;
+    stopBuzzer();
   }
 }
 
+// ============================================================
+//  Touch processing
+// ============================================================
 void processTouch() {
   bool touched = digitalRead(TOUCH_PIN) == HIGH;
   uint32_t now = millis();
@@ -283,10 +333,10 @@ void handleEvents() {
   currentEvent = EVENT_NONE;
   lastActivityTime = millis();
 
-  // During the fanfare, a single tap cancels it and does nothing else.
   if (fanfareActive) {
     if (event == EVENT_SINGLE_TAP) {
       fanfareActive = false;
+      stopBuzzer();
       renderDisplay();
     }
     return;
@@ -294,15 +344,12 @@ void handleEvents() {
 
   if (event == EVENT_DOUBLE_TAP) {
     if (currentMode == MODE_STOPWATCH) {
-      // Always switch to timer and reset the stopwatch on the way out,
-      // even if it was running or paused.
       updateStopwatch();
       swElapsedMs = 0;
       swState = SW_STOPPED;
       swLastUpdate = millis();
       currentMode = MODE_TIMER;
     } else {
-      // Leaving timer mode stops the countdown and restores the set value.
       timerState = T_IDLE;
       timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
       currentMode = MODE_STOPWATCH;
@@ -324,7 +371,6 @@ void handleEvents() {
       }
     }
   } else {
-    // Timer mode
     if (event == EVENT_SINGLE_TAP) {
       if (timerState == T_IDLE) {
         if (timerMinutes > 0) {
@@ -343,100 +389,84 @@ void handleEvents() {
   }
 }
 
-String makeConfigPage(const String& message = "") {
-  String ssid = preferences.getString("ssid", "");
-  String page;
-  page.reserve(1800);
-  page += F("<!doctype html><html lang='ru'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-  page += F("<meta charset='utf-8'><title>Wi-Fi setup</title><style>");
-  page += F("body{font:16px sans-serif;max-width:480px;margin:30px auto;padding:0 16px;background:#f5f5f5}");
-  page += F("form{background:white;padding:20px;border-radius:12px}input,button{box-sizing:border-box;width:100%;padding:12px;margin:8px 0;font-size:16px}");
-  page += F("</style><h2>Настройка Wi-Fi</h2><form method='POST' action='/save'>");
-  page += F("<label>Имя сети (SSID)</label><input name='ssid' maxlength='32' required value='");
-  page += htmlEscape(ssid);
-  page += F("'><label>Пароль Wi-Fi</label><input name='pass' type='password' maxlength='63' autocomplete='new-password'>");
-  page += F("<p>Оставьте пароль пустым, чтобы не менять сохранённый пароль.</p>");
-  page += F("<button type='submit'>Сохранить и подключиться</button></form>");
-  if (message.length()) {
-    page += F("<p>");
-    page += htmlEscape(message);
-    page += F("</p>");
-  }
-  page += F("</html>");
-  return page;
-}
+// ============================================================
+//  Deep sleep
+// ============================================================
+void goToDeepSleep() {
+  Serial.println("Entering deep sleep...");
 
-void handleRoot() {
-  webActivity = true;
-  server.send(200, "text/html; charset=utf-8", makeConfigPage());
-}
+  stopBuzzer();
 
-void handleSave() {
-  webActivity = true;
-  String ssid = server.arg("ssid");
-  String pass = server.arg("pass");
-  ssid.trim();
+  preferences.putULong64("swms", swElapsedMs);
+  preferences.putUChar("mode", (uint8_t)currentMode);
+  preferences.putUChar("swstate", (uint8_t)swState);
+  preferences.putUShort("tmins", timerMinutes);
+  preferences.putULong64("tleft", timerRemainingMs);
+  preferences.putUChar("tstate", (uint8_t)timerState);
 
-  if (ssid.isEmpty() || ssid.length() > 32 || pass.length() > 63) {
-    server.send(400, "text/html; charset=utf-8", makeConfigPage("Проверьте имя сети и пароль."));
+  turnDisplayOff();
+
+  pinMode(TOUCH_PIN, INPUT);
+  if (digitalRead(TOUCH_PIN) == HIGH) {
+    Serial.println("Touch active, aborting sleep.");
+    turnDisplayOn();
     return;
   }
 
-  preferences.putString("ssid", ssid);
-  if (pass.length() > 0) preferences.putString("pass", pass);
-  wifiConfigured = true;
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << TOUCH_PIN, ESP_GPIO_WAKEUP_GPIO_HIGH);
 
-  String response = F("<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><p>Настройки сохранены. ESP32 подключается к сети. Если страница перестанет открываться, подключитесь к точке доступа Timer-Setup снова.</p></html>");
-  server.send(200, "text/html; charset=utf-8", response);
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
 
-  String savedPass = preferences.getString("pass", "");
-  WiFi.begin(ssid.c_str(), savedPass.c_str());
+  esp_deep_sleep_start();
 }
 
-void startWebAndWiFi() {
-  preferences.begin("timerwifi", false);
-  String ssid = preferences.getString("ssid", "");
-  String pass = preferences.getString("pass", "");
-  wifiConfigured = !ssid.isEmpty();
-
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-
-  if (wifiConfigured) WiFi.begin(ssid.c_str(), pass.c_str());
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/save", HTTP_POST, handleSave);
-  server.onNotFound([]() {
-    webActivity = true;
-    server.sendHeader("Location", "/", true);
-    server.send(302, "text/plain", "");
-  });
-  server.begin();
-}
-
+// ============================================================
+//  Setup
+// ============================================================
 void restoreState() {
-  // Stopwatch is not persisted across reboots.
-  swElapsedMs = 0;
-  swState = SW_STOPPED;
-  swLastUpdate = millis();
-
-  // Timer set value is persisted.
+  swElapsedMs = preferences.getULong64("swms", 0);
+  uint8_t savedMode = preferences.getUChar("mode", MODE_STOPWATCH);
+  currentMode = (savedMode <= MODE_TIMER) ? (Mode)savedMode : MODE_STOPWATCH;
+  uint8_t savedSwState = preferences.getUChar("swstate", SW_STOPPED);
+  swState = (savedSwState <= SW_PAUSED) ? (SwState)savedSwState : SW_STOPPED;
   timerMinutes = preferences.getUShort("tmins", 1);
-  if (timerMinutes > MAX_TIMER_MINUTES) timerMinutes = 1;
-  timerRemainingMs = (uint64_t)timerMinutes * 60000ULL;
-  timerState = T_IDLE;
-  timerLastUpdate = millis();
+  if (timerMinutes < 1 || timerMinutes > MAX_TIMER_MINUTES) timerMinutes = 1;
+  timerRemainingMs = preferences.getULong64("tleft", (uint64_t)timerMinutes * 60000ULL);
+  uint8_t savedTState = preferences.getUChar("tstate", T_IDLE);
+  timerState = (savedTState <= T_PAUSED) ? (TimerState)savedTState : T_IDLE;
 
-  currentMode = MODE_STOPWATCH;
-  fanfareActive = false;
+  if (swState == SW_RUNNING) swState = SW_PAUSED;
+  if (timerState == T_RUNNING) timerState = T_PAUSED;
+
+  swLastUpdate = millis();
+  timerLastUpdate = millis();
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(TOUCH_PIN, INPUT);
-  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(100);
 
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  wokeFromSleep = (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO);
+  if (wokeFromSleep) {
+    Serial.println("Woke up from GPIO (touch)");
+  } else {
+    Serial.println("Power-on or reset");
+  }
+
+  improvSerial.setDeviceInfo(ImprovTypes::ChipFamily::CF_ESP32_C3,
+                             "Timer-Device-9a4c2b",
+                             "1.0.0",
+                             "ESP32 Timer");
+  improvSerial.onImprovConnected(onImprovConnected);
+  improvSerial.onImprovError(onImprovError);
+
+  // Инициализация бузера
+  ledcAttach(BUZZER_PIN, BUZZER_FREQ, 8);
+  ledcWrite(BUZZER_PIN, 0);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
   if (!display.begin(0x3C, true)) {
     while (true) delay(100);
   }
@@ -446,52 +476,41 @@ void setup() {
 
   preferences.begin("timerwifi", false);
   restoreState();
-  startWebAndWiFi();
+
+  // Wi-Fi: включаем режим станции всегда, чтобы Improv мог работать.
+  // После пробуждения из глубокого сна модуль был выключен, поэтому
+  // без этой строки Improv вернёт "Wi-Fi turned off".
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();  // попытка подключиться к сохранённой сети
 
   displayOn = true;
   lastActivityTime = millis();
   renderDisplay();
 }
 
+// ============================================================
+//  Loop
+// ============================================================
 void loop() {
-  webActivity = false;
-  server.handleClient();
-
-  // Wake the display on touch or web activity.
-  if (!displayOn) {
-    bool touched = digitalRead(TOUCH_PIN) == HIGH;
-    if (webActivity || (touched && !lastTouchState)) {
-      turnDisplayOn();
-      pendingSingleTap = false;
-      currentEvent = EVENT_NONE;
-      // fall through and let processTouch() handle the new press
-    } else {
-      lastTouchState = touched;
-      updateStopwatch();
-      updateTimer();
-      updateFanfare();
-      if (webActivity) lastActivityTime = millis();
-      delay(5);
-      return;
-    }
-  }
+  improvSerial.handleSerial();
 
   processTouch();
   updateStopwatch();
   updateTimer();
   updateFanfare();
+  updateBuzzer();
   handleEvents();
 
-  if (webActivity) lastActivityTime = millis();
-
-  renderDisplay();
+  if (displayOn) {
+    renderDisplay();
+  }
 
   bool stopwatchActive = (swState == SW_RUNNING) || (swState == SW_PAUSED);
   bool timerActive = (timerState == T_RUNNING) || (timerState == T_PAUSED) ||
                      (timerState == T_SETUP) || fanfareActive;
   if (!stopwatchActive && !timerActive &&
       (uint32_t)(millis() - lastActivityTime) >= IDLE_TIMEOUT_MS) {
-    turnDisplayOff();
+    goToDeepSleep();
   }
 
   delay(5);
